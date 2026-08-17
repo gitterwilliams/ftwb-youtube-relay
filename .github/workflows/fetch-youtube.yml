@@ -1,0 +1,98 @@
+name: Fetch FTWB YouTube data
+
+on:
+  schedule:
+    # 22:30 UTC = 5:30 PM Central (CDT). 15 minutes ahead of the Claude job.
+    - cron: '30 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch YouTube data
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.parse, datetime
+
+          KEY = os.environ["YT_API_KEY"]
+          CHANNEL = "UC6CJpFymqgNtEmKmFYL-qxw"
+          UPLOADS = "UU6CJpFymqgNtEmKmFYL-qxw"
+          BASE = "https://www.googleapis.com/youtube/v3/"
+
+          def api(endpoint, **params):
+              params["key"] = KEY
+              url = BASE + endpoint + "?" + urllib.parse.urlencode(params)
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  return json.load(r)
+
+          def paged(endpoint, **params):
+              items, token = [], None
+              while True:
+                  if token:
+                      params["pageToken"] = token
+                  d = api(endpoint, **params)
+                  items += d.get("items", [])
+                  token = d.get("nextPageToken")
+                  if not token:
+                      break
+              return items
+
+          # 1. Most recent uploads
+          recent = api("playlistItems", part="contentDetails",
+                       playlistId=UPLOADS, maxResults=25)
+          ids = [i["contentDetails"]["videoId"] for i in recent.get("items", [])]
+
+          # 2. Full metadata for those videos
+          meta = api("videos", part="snippet,contentDetails,statistics",
+                     id=",".join(ids), maxResults=50)
+
+          # 3. Current playlist membership, so the job never recommends a
+          #    playlist a video is already in.
+          membership = {}
+          for p in paged("playlists", part="snippet", channelId=CHANNEL, maxResults=50):
+              title = p["snippet"]["title"]
+              for it in paged("playlistItems", part="contentDetails",
+                              playlistId=p["id"], maxResults=50):
+                  membership.setdefault(it["contentDetails"]["videoId"], []).append(title)
+
+          videos = []
+          for v in meta.get("items", []):
+              s = v.get("snippet", {})
+              videos.append({
+                  "id": v["id"],
+                  "title": s.get("title", ""),
+                  "description": s.get("description", ""),
+                  "publishedAt": s.get("publishedAt", ""),
+                  "duration": v.get("contentDetails", {}).get("duration", ""),
+                  "viewCount": v.get("statistics", {}).get("viewCount", "0"),
+                  "playlists": sorted(membership.get(v["id"], [])),
+              })
+          videos.sort(key=lambda x: x["publishedAt"], reverse=True)
+
+          out = {
+              "generatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "channelId": CHANNEL,
+              "videoCount": len(videos),
+              "videos": videos,
+          }
+          os.makedirs("data", exist_ok=True)
+          with open("data/latest.json", "w") as f:
+              json.dump(out, f, indent=2, ensure_ascii=False)
+          print("wrote", len(videos), "videos")
+          PY
+
+      - name: Commit result
+        run: |
+          git config user.name "ftwb-relay-bot"
+          git config user.email "actions@github.com"
+          git add data/latest.json
+          git diff --staged --quiet || git commit -m "Update YouTube data"
+          git push
